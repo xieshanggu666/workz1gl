@@ -5,6 +5,10 @@ import path from 'node:path'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const db = new DatabaseSync(path.join(__dirname, 'event.db'))
 
+// 并发写者排队等待而非立即报 SQLITE_BUSY（多进程/多连接同时审核报名时兜底）
+db.exec('PRAGMA busy_timeout = 5000')
+db.exec('PRAGMA journal_mode = WAL')
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS sports (
   id INTEGER PRIMARY KEY,
@@ -156,3 +160,23 @@ db.prepare(`UPDATE matches SET winner = CASE WHEN score_a > score_b THEN team_a 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }
 export function get(sql, ...p) { return db.prepare(sql).get(...p) }
+
+// 事务助手：BEGIN IMMEDIATE 在事务开启时即取写锁，把"名额检查 → 占位 → 级联写入"
+// 这类读-改-写序列在并发下串行化，杜绝两个审核请求同时通过名额检查。
+// 支持嵌套调用：内层直接并入外层事务，由最外层统一提交；任一环节抛错整体回滚。
+let txDepth = 0
+export function withTransaction(fn) {
+  if (txDepth > 0) return fn()
+  db.exec('BEGIN IMMEDIATE')
+  txDepth++
+  try {
+    const result = fn()
+    db.exec('COMMIT')
+    return result
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 连接已回滚 */ }
+    throw e
+  } finally {
+    txDepth--
+  }
+}
