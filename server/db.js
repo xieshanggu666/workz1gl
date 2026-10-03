@@ -5,6 +5,10 @@ import path from 'node:path'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const db = new DatabaseSync(path.join(__dirname, 'event.db'))
 
+// 写锁等待：多进程/集群共享同一库文件时，BEGIN IMMEDIATE 抢锁会等待而非立即报 SQLITE_BUSY，
+// 配合事务把并发的"检查 → 写入"序列串行化
+db.exec('PRAGMA busy_timeout = 5000')
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS sports (
   id INTEGER PRIMARY KEY,
@@ -156,3 +160,18 @@ db.prepare(`UPDATE matches SET winner = CASE WHEN score_a > score_b THEN team_a 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }
 export function get(sql, ...p) { return db.prepare(sql).get(...p) }
+
+// 事务包装：多步写入要么全部提交、要么整体回滚，绝不留半残状态。
+// BEGIN IMMEDIATE 立即获取写锁，把"检查 → 写入"序列整体串行化，
+// 并发请求（多进程/集群共享同一库文件）不会在名额检查等处同时放行。
+export function tx(fn) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const r = fn()
+    db.exec('COMMIT')
+    return r
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+    throw e
+  }
+}

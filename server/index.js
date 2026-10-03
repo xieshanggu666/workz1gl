@@ -1,9 +1,9 @@
 import express from 'express'
-import { db, run, all, get } from './db.js'
+import { run, all, get, tx } from './db.js'
 
 const app = express()
 app.use(express.json())
-const PORT = 4170
+const PORT = process.env.PORT || 4170
 
 /* ================= 裁判排班：常量与工具 ================= */
 const ROLE_NAME = { chief: '主裁', assistant: '助理裁判', recorder: '记录台' }
@@ -515,20 +515,19 @@ function rebuildStandings(sportId) {
     done.forEach(m => {
       const rowA = get('SELECT * FROM standings WHERE sport_id=? AND team_id=?', sid, m.team_a)
       const rowB = get('SELECT * FROM standings WHERE sport_id=? AND team_id=?', sid, m.team_b)
-      if (!rowA || !rowB) return
+      // 双方均已失去资格的场次不再计入；一方失格的弃权场次（3:0 判负）只为仍在榜一方累计，
+      // 保证历史完赛场次的积分口径与实际赛果一致，不因对手退报/失格而丢分
+      if (!rowA && !rowB) return
       const sa = m.score_a, sb = m.score_b
-      // 已存在记录则不重复累加
-      if (m._acc) return
-      rowA.play += 1; rowB.play += 1
-      rowA.gf += sa; rowA.ga += sb; rowB.gf += sb; rowB.ga += sa
-      if (sa > sb) { rowA.win++; rowB.lose++; rowA.points += 3 }
-      else if (sa < sb) { rowB.win++; rowA.lose++; rowB.points += 3 }
-      else { rowA.draw++; rowB.draw++; rowA.points += 1; rowB.points += 1 }
-      run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
+      if (rowA) { rowA.play += 1; rowA.gf += sa; rowA.ga += sb }
+      if (rowB) { rowB.play += 1; rowB.gf += sb; rowB.ga += sa }
+      if (sa > sb) { if (rowA) { rowA.win++; rowA.points += 3 } if (rowB) rowB.lose++ }
+      else if (sa < sb) { if (rowB) { rowB.win++; rowB.points += 3 } if (rowA) rowA.lose++ }
+      else { if (rowA) { rowA.draw++; rowA.points += 1 } if (rowB) { rowB.draw++; rowB.points += 1 } }
+      if (rowA) run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
         rowA.play, rowA.win, rowA.draw, rowA.lose, rowA.gf, rowA.ga, rowA.points, rowA.id)
-      run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
+      if (rowB) run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
         rowB.play, rowB.win, rowB.draw, rowB.lose, rowB.gf, rowB.ga, rowB.points, rowB.id)
-      m._acc = 1
     })
     // 排名
     const rows = all('SELECT * FROM standings WHERE sport_id=?', sid).sort((x, y) => y.points - x.points || (y.gf - y.ga) - (x.gf - x.ga) || x.id - y.id)
@@ -850,10 +849,14 @@ function initRoundRobinSchedule(sportId, oldMatches) {
     if (venueId) taken.add(`${venueId}:${label}`)
     return label
   }
-  return ([a, b], orderNo) => {
+  return ([a, b]) => {
     const old = oldByPair.get(`${Math.min(a, b)}-${Math.max(a, b)}`)
     const venueId = old?.venue_id || defaultVenueId
-    const timeLabel = old?.time_label || nextSlot(venueId)
+    // 沿用的历史时段同样要登记占用；若已被其它对阵占用则让位换新时段，避免重排后同场地同时段撞场
+    let timeLabel = old?.time_label || null
+    if (venueId && timeLabel && taken.has(`${venueId}:${timeLabel}`)) timeLabel = null
+    if (!timeLabel) timeLabel = nextSlot(venueId)
+    else if (venueId) taken.add(`${venueId}:${timeLabel}`)
     return { venueId, timeLabel }
   }
 }
@@ -951,8 +954,7 @@ function finishTrack(sportId, body) {
   }
 
   // 事务写入：任一更新失败整体回滚，绝不允许半结算污染排名与奖牌
-  db.exec('BEGIN')
-  try {
+  tx(() => {
     // 清理失去资格（退报/撤销）运动员残留的成绩档案
     entries.filter(e => e.status !== 'approved').forEach(e => run('DELETE FROM entries WHERE id=?', e.entry_id))
     rows.sort((a, b) => a.mark - b.mark)
@@ -962,189 +964,224 @@ function finishTrack(sportId, body) {
         r.mark, i + 1, unitId, r.athleteId, sportId)
     })
     run('UPDATE sports SET finished=1 WHERE id=?', sportId)
-    db.exec('COMMIT')
-  } catch (e) {
-    db.exec('ROLLBACK')
-    throw e
-  }
+  })
 
   recomputeMedals()
 }
 /* ================= 参赛资格审核（报名 → 审核 → 退报/撤销） ================= */
 function submitRegistration(kind, unitId, sportId, name) {
-  if (!get('SELECT id FROM units WHERE id=?', unitId)) throw new Error('参赛单位不存在')
-  if (!get('SELECT id FROM sports WHERE id=?', sportId)) throw new Error('比赛项目不存在')
-  name = (name || '').trim()
-  if (!name) throw new Error('名称不能为空')
-  if (kind === 'team') {
-    if (get('SELECT id FROM teams WHERE name=? AND sport_id=? AND unit_id=?', name, sportId, unitId)) throw new Error('该单位已报名同名队伍')
-    const r = run('INSERT INTO teams (name,unit_id,sport_id,status) VALUES (?,?,?,?)', name, unitId, sportId, 'pending')
-    const teamId = Number(r.lastInsertRowid)
-    run('INSERT INTO registrations (kind,unit_id,sport_id,team_id,name,status) VALUES (?,?,?,?,?,?)', kind, unitId, sportId, teamId, name, 'pending')
-    return { id: teamId, kind }
-  }
-  if (get('SELECT id FROM athletes WHERE name=? AND sport_id=? AND unit_id=?', name, sportId, unitId)) throw new Error('该单位已报名同名运动员')
-  const r = run('INSERT INTO athletes (name,unit_id,sport_id,status) VALUES (?,?,?,?)', name, unitId, sportId, 'pending')
-  const athId = Number(r.lastInsertRowid)
-  run('INSERT INTO registrations (kind,unit_id,sport_id,athlete_id,name,status) VALUES (?,?,?,?,?,?)', kind, unitId, sportId, athId, name, 'pending')
-  return { id: athId, kind }
+  // 事务：参赛主体与报名记录要么同时落库，要么整体回滚，不留孤儿数据
+  return tx(() => {
+    if (!get('SELECT id FROM units WHERE id=?', unitId)) throw new Error('参赛单位不存在')
+    if (!get('SELECT id FROM sports WHERE id=?', sportId)) throw new Error('比赛项目不存在')
+    name = (name || '').trim()
+    if (!name) throw new Error('名称不能为空')
+    if (kind === 'team') {
+      if (get('SELECT id FROM teams WHERE name=? AND sport_id=? AND unit_id=?', name, sportId, unitId)) throw new Error('该单位已报名同名队伍')
+      const r = run('INSERT INTO teams (name,unit_id,sport_id,status) VALUES (?,?,?,?)', name, unitId, sportId, 'pending')
+      const teamId = Number(r.lastInsertRowid)
+      run('INSERT INTO registrations (kind,unit_id,sport_id,team_id,name,status) VALUES (?,?,?,?,?,?)', kind, unitId, sportId, teamId, name, 'pending')
+      return { id: teamId, kind }
+    }
+    if (get('SELECT id FROM athletes WHERE name=? AND sport_id=? AND unit_id=?', name, sportId, unitId)) throw new Error('该单位已报名同名运动员')
+    const r = run('INSERT INTO athletes (name,unit_id,sport_id,status) VALUES (?,?,?,?)', name, unitId, sportId, 'pending')
+    const athId = Number(r.lastInsertRowid)
+    run('INSERT INTO registrations (kind,unit_id,sport_id,athlete_id,name,status) VALUES (?,?,?,?,?,?)', kind, unitId, sportId, athId, name, 'pending')
+    return { id: athId, kind }
+  })
+}
+
+// 循环赛程重排（报名通过纳入新队伍）：仅重建待赛场次；
+// 已完赛/已取消的历史场次及其执法留痕、积分与奖牌统计口径全部保留，不做物理删除
+function rebuildRoundRobinSchedule(reg, reviewer) {
+  const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
+  const old = all(`SELECT * FROM matches WHERE sport_id=? AND status='scheduled'`, reg.sport_id)
+  // 赛程重排：先释放旧待赛场次在派执法安排并留痕，再重建对阵
+  old.forEach(m => releaseAssignmentsOfMatch(m, '报名通过触发循环赛程重排', reviewer || '系统'))
+  run(`DELETE FROM matches WHERE sport_id=? AND status='scheduled'`, reg.sport_id)
+  const teams = all(`SELECT id FROM teams WHERE sport_id=? AND status='approved' ORDER BY id`, reg.sport_id).map(t => t.id)
+  const pairList = arr => { const p = []; for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) p.push([arr[i], arr[j]]); return p }
+  const scheduleFor = initRoundRobinSchedule(reg.sport_id, old)
+  // 新场次编号接续历史场次，避免与保留的历史赛程在展示排序上交错
+  let ono = get('SELECT COALESCE(MAX(order_no),0) m FROM matches WHERE sport_id=?', reg.sport_id).m
+  const newIds = []
+  pairList(teams).forEach(([a, b]) => {
+    ono++
+    const { venueId, timeLabel } = scheduleFor([a, b])
+    const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)',
+      reg.sport_id, '循环', a, b, venueId, ono, timeLabel, 'scheduled')
+    newIds.push(Number(r.lastInsertRowid))
+  })
+  const crewResult = autoCrewForNewMatches(newIds, reviewer || '系统')
+  const skipText = crewResult.skipped.length ? `；${crewResult.skipped.length} 个执法席位待排班` : ''
+  addLog('schedule_rebuild', null, null,
+    `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场；时间、场地已初始化，整场协同排班补齐 ${crewResult.assigned.length} 个执法席位（主裁/助理/记录台）${skipText}`,
+    null, reviewer || '系统')
 }
 
 function approveRegistration(regId, reviewer) {
-  const reg = get('SELECT * FROM registrations WHERE id=?', regId)
-  if (!reg) throw new Error('报名记录不存在')
-  if (reg.status !== 'pending') throw new Error('该报名已处理，不能重复审核')
-  const quota = get('SELECT quota FROM sports WHERE id=?', reg.sport_id)?.quota ?? 8
-  const approved = reg.kind === 'team'
-    ? get(`SELECT COUNT(*) c FROM teams WHERE sport_id=? AND status='approved'`, reg.sport_id).c
-    : get(`SELECT COUNT(*) c FROM athletes WHERE sport_id=? AND status='approved'`, reg.sport_id).c
-  if (approved >= quota) throw new Error(`名额已满（${quota} 个），无法通过`)
-  const quotaNo = approved + 1
-  run(`UPDATE registrations SET status='approved', quota_no=?, reviewed_at=datetime('now','localtime'), reviewer=? WHERE id=?`, quotaNo, reviewer || '组委会', regId)
-  if (reg.kind === 'team') {
-    run(`UPDATE teams SET status='approved' WHERE id=?`, reg.team_id)
-    // 循环赛：若尚未开赛，重新排定循环赛程，把新队伍纳入对阵
-    const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
-    const finished = get(`SELECT COUNT(*) c FROM matches WHERE sport_id=? AND status='finished'`, reg.sport_id).c
-    if (spo.format === 'roundrobin' && finished === 0) {
-      // 赛程重排：先释放旧场次在派执法安排并留痕，再重建对阵
-      const old = all(`SELECT * FROM matches WHERE sport_id=?`, reg.sport_id)
-      old.forEach(m => releaseAssignmentsOfMatch(m, '报名通过触发循环赛程重排', reviewer || '系统'))
-      run(`DELETE FROM matches WHERE sport_id=?`, reg.sport_id)
-      const teams = all(`SELECT id FROM teams WHERE sport_id=? AND status='approved' ORDER BY id`, reg.sport_id).map(t => t.id)
-      const pairList = arr => { const p = []; for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) p.push([arr[i], arr[j]]); return p }
-      const scheduleFor = initRoundRobinSchedule(reg.sport_id, old)
-      let ono = 0
-      const newIds = []
-      pairList(teams).forEach(([a, b]) => {
-        ono++
-        const { venueId, timeLabel } = scheduleFor([a, b], ono)
-        const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)',
-          reg.sport_id, '循环', a, b, venueId, ono, timeLabel, 'scheduled')
-        newIds.push(Number(r.lastInsertRowid))
-      })
-      const crewResult = autoCrewForNewMatches(newIds, reviewer || '系统')
-      const skipText = crewResult.skipped.length ? `；${crewResult.skipped.length} 个执法席位待排班` : ''
-      addLog('schedule_rebuild', null, null,
-        `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场；时间、场地已初始化，整场协同排班补齐 ${crewResult.assigned.length} 个执法席位（主裁/助理/记录台）${skipText}`,
-        null, reviewer || '系统')
+  // 事务 + 幂等：并发/重复审核不会同时放行造成超额参赛，不会重复占用名额序号，
+  // 也不会重复触发循环赛程重排；任一步骤失败整体回滚，不留半残状态
+  return tx(() => {
+    const reg = get('SELECT * FROM registrations WHERE id=?', regId)
+    if (!reg) throw new Error('报名记录不存在')
+    // 审核幂等：重复"通过"直接返回首次审核结果（同一名额序号），不再产生任何副作用
+    if (reg.status === 'approved') return { ok: true, quota_no: reg.quota_no, idempotent: true }
+    if (reg.status !== 'pending') throw new Error('该报名已处理，不能重复审核')
+    const quota = get('SELECT quota FROM sports WHERE id=?', reg.sport_id)?.quota ?? 8
+    const table = reg.kind === 'team' ? 'teams' : 'athletes'
+    const targetId = reg.kind === 'team' ? reg.team_id : reg.athlete_id
+    // 原子名额检查：占用名额与状态翻转为同一条 UPDATE，并发审核在数据库层串行，检查与放行之间无窗口
+    const flip = run(`UPDATE ${table} SET status='approved'
+                      WHERE id=? AND status='pending'
+                        AND (SELECT COUNT(*) FROM ${table} WHERE sport_id=? AND status='approved') < ?`,
+      targetId, reg.sport_id, quota)
+    if (!flip.changes) {
+      const cur = get(`SELECT status FROM ${table} WHERE id=?`, targetId)
+      if (!cur) throw new Error('报名关联的参赛主体不存在')
+      if (cur.status !== 'pending') throw new Error('该报名已处理，不能重复审核')
+      throw new Error(`名额已满（${quota} 个），无法通过`)
     }
-  } else {
-    run(`UPDATE athletes SET status='approved' WHERE id=?`, reg.athlete_id)
-    // 田径：审核通过即建立成绩档案（成绩留空待录），否则该运动员无法参与成绩录入与结算
-    const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
-    if (spo.format === 'track') {
-      const exists = get('SELECT id FROM entries WHERE sport_id=? AND athlete_id=?', reg.sport_id, reg.athlete_id)
-      if (!exists) {
-        run('INSERT INTO entries (sport_id,athlete_id,mark,rank,unit_id) VALUES (?,?,NULL,NULL,?)',
-          reg.sport_id, reg.athlete_id, reg.unit_id)
+    // 名额序号 = 通过后的已占名额数（写事务内读取，并发下不会重号、不会跳号超发）
+    const quotaNo = get(`SELECT COUNT(*) c FROM ${table} WHERE sport_id=? AND status='approved'`, reg.sport_id).c
+    const regFlip = run(`UPDATE registrations SET status='approved', quota_no=?, reviewed_at=datetime('now','localtime'), reviewer=?
+                         WHERE id=? AND status='pending'`, quotaNo, reviewer || '组委会', regId)
+    if (!regFlip.changes) throw new Error('该报名已处理，不能重复审核')
+    if (reg.kind === 'team') {
+      // 循环赛：若尚未开赛，重新排定循环赛程，把新队伍纳入对阵
+      const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
+      const finished = get(`SELECT COUNT(*) c FROM matches WHERE sport_id=? AND status='finished'`, reg.sport_id).c
+      if (spo.format === 'roundrobin' && finished === 0) rebuildRoundRobinSchedule(reg, reviewer)
+    } else {
+      // 田径：审核通过即建立成绩档案（成绩留空待录），否则该运动员无法参与成绩录入与结算
+      const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
+      if (spo.format === 'track') {
+        const exists = get('SELECT id FROM entries WHERE sport_id=? AND athlete_id=?', reg.sport_id, reg.athlete_id)
+        if (!exists) {
+          run('INSERT INTO entries (sport_id,athlete_id,mark,rank,unit_id) VALUES (?,?,NULL,NULL,?)',
+            reg.sport_id, reg.athlete_id, reg.unit_id)
+        }
       }
     }
-  }
-  rebuildStandings(reg.sport_id)
-  recomputeMedals()
-  return { ok: true, quota_no: quotaNo }
+    rebuildStandings(reg.sport_id)
+    recomputeMedals()
+    return { ok: true, quota_no: quotaNo }
+  })
 }
 
 function rejectRegistration(regId, note, reviewer) {
-  const reg = get('SELECT * FROM registrations WHERE id=?', regId)
-  if (!reg) throw new Error('报名记录不存在')
-  if (reg.status !== 'pending') throw new Error('该报名已处理')
-  run(`UPDATE registrations SET status='rejected', review_note=?, reviewed_at=datetime('now','localtime'), reviewer=? WHERE id=?`, note || '资料不符', reviewer || '组委会', regId)
-  if (reg.kind === 'team') run(`UPDATE teams SET status='rejected' WHERE id=?`, reg.team_id)
-  else run(`UPDATE athletes SET status='rejected' WHERE id=?`, reg.athlete_id)
-  return { ok: true }
+  // 事务 + 幂等：状态翻转为条件更新，并发驳回不会重复写入；重复驳回同一报名直接返回成功
+  return tx(() => {
+    const reg = get('SELECT * FROM registrations WHERE id=?', regId)
+    if (!reg) throw new Error('报名记录不存在')
+    if (reg.status === 'rejected') return { ok: true, idempotent: true }
+    if (reg.status !== 'pending') throw new Error('该报名已处理')
+    const flip = run(`UPDATE registrations SET status='rejected', review_note=?, reviewed_at=datetime('now','localtime'), reviewer=?
+                      WHERE id=? AND status='pending'`, note || '资料不符', reviewer || '组委会', regId)
+    if (!flip.changes) throw new Error('该报名已处理')
+    if (reg.kind === 'team') run(`UPDATE teams SET status='rejected' WHERE id=? AND status='pending'`, reg.team_id)
+    else run(`UPDATE athletes SET status='rejected' WHERE id=? AND status='pending'`, reg.athlete_id)
+    return { ok: true }
+  })
 }
 
 // 退报（单位主动）/ 撤销资格（组委会）：同步处理受影响的对阵及成绩
 function withdrawOrRevoke(regId, action, note, reviewer) {
-  const reg = get('SELECT * FROM registrations WHERE id=?', regId)
-  if (!reg) throw new Error('报名记录不存在')
-  if (reg.status !== 'approved') throw new Error('仅已通过的报名可退报/撤销')
-  const newStatus = action === 'withdraw' ? 'withdrawn' : 'revoked'
-  const reason = note || (action === 'withdraw' ? '单位退报' : '组委会撤销资格')
-  run(`UPDATE registrations SET status=?, review_note=?, reviewed_at=datetime('now','localtime'), reviewer=? WHERE id=?`, newStatus, reason, reviewer || '组委会', regId)
-  const impact = { voided: 0, walkover: 0, entries: 0, replacements: 0, cascade: 0 }
-  if (reg.kind === 'team') {
-    run(`UPDATE teams SET status=? WHERE id=?`, newStatus, reg.team_id)
-    const teamId = reg.team_id
-    const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
-    const walkoverNote = action === 'withdraw' ? '弃权(退报)' : '弃权(撤销资格)'
-    const voidNote = action === 'withdraw' ? '成绩取消(退报)' : '成绩取消(撤销资格)'
-    const replaceNote = action === 'withdraw' ? '退报递补调整' : '撤销资格递补调整'
-    const operator = reviewer || '系统'
-    const matchesOfTeam = () => all(`SELECT * FROM matches WHERE sport_id=? AND (team_a=? OR team_b=?)`, reg.sport_id, teamId, teamId)
+  // 事务 + 幂等：退报/撤销及其对阵、成绩、积分、奖牌级联要么全部生效，要么整体回滚；
+  // 已处于目标状态的重复请求直接返回首次结果，不重复触发级联
+  return tx(() => {
+    const reg = get('SELECT * FROM registrations WHERE id=?', regId)
+    if (!reg) throw new Error('报名记录不存在')
+    const newStatus = action === 'withdraw' ? 'withdrawn' : 'revoked'
+    const impact = { voided: 0, walkover: 0, entries: 0, replacements: 0, cascade: 0 }
+    if (reg.status === newStatus) return { ok: true, idempotent: true, impact }
+    if (reg.status !== 'approved') throw new Error('仅已通过的报名可退报/撤销')
+    const reason = note || (action === 'withdraw' ? '单位退报' : '组委会撤销资格')
+    // 原子状态翻转：并发退报/撤销在数据库层串行，只有一方能进入级联
+    const flip = run(`UPDATE registrations SET status=?, review_note=?, reviewed_at=datetime('now','localtime'), reviewer=?
+                      WHERE id=? AND status='approved'`, newStatus, reason, reviewer || '组委会', regId)
+    if (!flip.changes) throw new Error('仅已通过的报名可退报/撤销')
+    if (reg.kind === 'team') {
+      run(`UPDATE teams SET status=? WHERE id=?`, newStatus, reg.team_id)
+      const teamId = reg.team_id
+      const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
+      const walkoverNote = action === 'withdraw' ? '弃权(退报)' : '弃权(撤销资格)'
+      const voidNote = action === 'withdraw' ? '成绩取消(退报)' : '成绩取消(撤销资格)'
+      const replaceNote = action === 'withdraw' ? '退报递补调整' : '撤销资格递补调整'
+      const operator = reviewer || '系统'
+      const matchesOfTeam = () => all(`SELECT * FROM matches WHERE sport_id=? AND (team_a=? OR team_b=?)`, reg.sport_id, teamId, teamId)
 
-    if (spo.format === 'roundrobin') {
-      matchesOfTeam().forEach(m => {
-        if (m.status === 'scheduled') {
-          const opponent = m.team_a === teamId ? m.team_b : m.team_a
-          if (isActiveTeam(opponent)) {
-            impact.walkover += finishWalkover(m, opponent, walkoverNote, operator) ? 1 : 0
-          } else {
+      if (spo.format === 'roundrobin') {
+        matchesOfTeam().forEach(m => {
+          if (m.status === 'scheduled') {
+            const opponent = m.team_a === teamId ? m.team_b : m.team_a
+            if (isActiveTeam(opponent)) {
+              impact.walkover += finishWalkover(m, opponent, walkoverNote, operator) ? 1 : 0
+            } else {
+              voidMatch(m, voidNote, operator)
+              impact.voided++
+            }
+          } else if (m.status === 'finished') {
             voidMatch(m, voidNote, operator)
             impact.voided++
           }
-        } else if (m.status === 'finished') {
-          voidMatch(m, voidNote, operator)
-          impact.voided++
+        })
+        rebuildStandings(reg.sport_id)
+      } else {
+        const processMatch = m => {
+          if (m.status === 'scheduled') {
+            const opponent = m.team_a === teamId ? m.team_b : m.team_a
+            if (isActiveTeam(opponent)) {
+              impact.walkover += finishWalkover(m, opponent, walkoverNote, operator) ? 1 : 0
+            } else {
+              voidMatch(m, voidNote, operator)
+              impact.voided++
+            }
+          } else if (m.status === 'finished') {
+            voidMatch(m, voidNote, operator)
+            impact.voided++
+          }
         }
-      })
-      rebuildStandings(reg.sport_id)
+
+        // 先处理已有小组成绩并刷新积分榜；半决赛递补必须基于取消成绩后的真实排名
+        matchesOfTeam().filter(m => m.group_name).forEach(processMatch)
+        rebuildStandings(reg.sport_id)
+
+        // 足球小组+淘汰：若半决赛尚未进行，先按同组积分榜顺位递补，避免后续轮次沿用失去资格的名额
+        const existingSemis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛' ORDER BY order_no,id`, reg.sport_id)
+        const sourceSemi = existingSemis.find(m => (m.team_a === teamId || m.team_b === teamId) && m.status === 'scheduled')
+        if (spo.format === 'group_knockout' && sourceSemi) {
+          const occupied = existingSemis.flatMap(m => [m.team_a, m.team_b]).filter(id => id != null && id !== teamId)
+          const groupName = get(`SELECT group_name FROM matches WHERE sport_id=? AND (team_a=? OR team_b=?) AND group_name IS NOT NULL LIMIT 1`, reg.sport_id, teamId, teamId)?.group_name
+          const substitute = groupAlternateFor(reg.sport_id, groupName, occupied)
+          if (substitute != null) {
+            replaceScheduledKnockoutTeam(sourceSemi, teamId, substitute, replaceNote, operator)
+            impact.replacements++
+          }
+        }
+
+        // 直接处理来源半决赛；已生成的决赛、季军战交给统一级联逻辑改赛、重赛或轮空，避免提前按旧对阵判弃权
+        matchesOfTeam()
+          .filter(m => !m.group_name && m.stage === '半决赛')
+          .forEach(processMatch)
+
+        // 统一同步决赛/季军战、轮空结算、执法安排和奖牌
+        rebuildStandings(reg.sport_id)
+        if (existingSemis.length) {
+          const r = reconcileKnockout(reg.sport_id, `${reason}触发淘汰赛级联调整`, operator)
+          impact.cascade = r.created + r.adjusted
+        }
+      }
     } else {
-      const processMatch = m => {
-        if (m.status === 'scheduled') {
-          const opponent = m.team_a === teamId ? m.team_b : m.team_a
-          if (isActiveTeam(opponent)) {
-            impact.walkover += finishWalkover(m, opponent, walkoverNote, operator) ? 1 : 0
-          } else {
-            voidMatch(m, voidNote, operator)
-            impact.voided++
-          }
-        } else if (m.status === 'finished') {
-          voidMatch(m, voidNote, operator)
-          impact.voided++
-        }
-      }
-
-      // 先处理已有小组成绩并刷新积分榜；半决赛递补必须基于取消成绩后的真实排名
-      matchesOfTeam().filter(m => m.group_name).forEach(processMatch)
-      rebuildStandings(reg.sport_id)
-
-      // 足球小组+淘汰：若半决赛尚未进行，先按同组积分榜顺位递补，避免后续轮次沿用失去资格的名额
-      const existingSemis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛' ORDER BY order_no,id`, reg.sport_id)
-      const sourceSemi = existingSemis.find(m => (m.team_a === teamId || m.team_b === teamId) && m.status === 'scheduled')
-      if (spo.format === 'group_knockout' && sourceSemi) {
-        const occupied = existingSemis.flatMap(m => [m.team_a, m.team_b]).filter(id => id != null && id !== teamId)
-        const groupName = get(`SELECT group_name FROM matches WHERE sport_id=? AND (team_a=? OR team_b=?) AND group_name IS NOT NULL LIMIT 1`, reg.sport_id, teamId, teamId)?.group_name
-        const substitute = groupAlternateFor(reg.sport_id, groupName, occupied)
-        if (substitute != null) {
-          replaceScheduledKnockoutTeam(sourceSemi, teamId, substitute, replaceNote, operator)
-          impact.replacements++
-        }
-      }
-
-      // 直接处理来源半决赛；已生成的决赛、季军战交给统一级联逻辑改赛、重赛或轮空，避免提前按旧对阵判弃权
-      matchesOfTeam()
-        .filter(m => !m.group_name && m.stage === '半决赛')
-        .forEach(processMatch)
-
-      // 统一同步决赛/季军战、轮空结算、执法安排和奖牌
-      rebuildStandings(reg.sport_id)
-      if (existingSemis.length) {
-        const r = reconcileKnockout(reg.sport_id, `${reason}触发淘汰赛级联调整`, operator)
-        impact.cascade = r.created + r.adjusted
-      }
+      run(`UPDATE athletes SET status=? WHERE id=?`, newStatus, reg.athlete_id)
+      // 田径：删除该运动员在该项目的成绩
+      const r = run(`DELETE FROM entries WHERE athlete_id=? AND sport_id=?`, reg.athlete_id, reg.sport_id)
+      impact.entries = r.changes
+      recomputeTrackRanks(reg.sport_id)
     }
-  } else {
-    run(`UPDATE athletes SET status=? WHERE id=?`, newStatus, reg.athlete_id)
-    // 田径：删除该运动员在该项目的成绩
-    const r = run(`DELETE FROM entries WHERE athlete_id=? AND sport_id=?`, reg.athlete_id, reg.sport_id)
-    impact.entries = r.changes
-    recomputeTrackRanks(reg.sport_id)
-  }
-  recomputeMedals()
-  return { ok: true, impact }
+    recomputeMedals()
+    return { ok: true, impact }
+  })
 }
 
 function recomputeTrackRanks(sportId) {
